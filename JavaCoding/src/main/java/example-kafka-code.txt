@@ -1,425 +1,76 @@
-package com.tdvps.admin.util;
-
-import com.tdvps.admin.model.KafkaEnvelope;
-import org.springframework.stereotype.Component;
-
 @Component
-public class ConsolePrinter {
+public class PollingService {
 
-    public void printEnvelope(
-            KafkaEnvelope envelope,
-            long offset,
+    private int emptyPolls;
+
+    public boolean shouldShutdown(
+            boolean recordsFound) {
+
+        if(recordsFound) {
+            emptyPolls = 0;
+            return false;
+        }
+
+        emptyPolls++;
+
+        return emptyPolls >= 10;
+    }
+}
+
+
+import java.util.List;
+
+@Service
+public class OffsetSeekService {
+
+    public void seek(
+            KafkaConsumer<String,String> consumer,
+            String topic,
             int partition,
-            String payload) {
+            long offset) {
 
-        System.out.println(
-                "================================================="
-        );
+        TopicPartition tp =
+                new TopicPartition(
+                        topic,
+                        partition);
 
-        System.out.println(
-                "Record UUID      : "
-                        + envelope.getRecordUuid()
-        );
+        consumer.assign(List.of(tp));
 
-        System.out.println(
-                "Record Timestamp : "
-                        + envelope.getRecordTimestamp()
-        );
-
-        System.out.println(
-                "Dataset UUID     : "
-                        + envelope.getDatasetStorageUuid()
-        );
-
-        System.out.println(
-                "Partition        : "
-                        + partition
-        );
-
-        System.out.println(
-                "Offset           : "
-                        + offset
-        );
-
-        System.out.println(
-                "Compression      : "
-                        + envelope.getRecordBodyCompression()
-        );
-
-        System.out.println(
-                "-------------------------------------------------"
-        );
-
-        System.out.println(payload);
-
-        System.out.println(
-                "================================================="
-        );
+        consumer.seek(tp, offset);
     }
 }
 
+@Service
+public class TimestampSeekService {
 
-======================================================================
-package com.tdvps.admin.consumer;
+    public void seekToTimestamp(
+            KafkaConsumer<String,String> consumer,
+            String topic,
+            int partition,
+            long timestamp) {
 
-@Component
-@RequiredArgsConstructor
-public class KafkaTopicReader {
+        TopicPartition tp =
+                new TopicPartition(topic,
+                        partition);
 
-    private final ObjectMapper mapper;
-    private final RecordBodyDecoder decoder;
-    private final CompressionDecoder compressionDecoder;
-    private final ConsolePrinter printer;
-    private final PollingService pollingService;
+        consumer.assign(List.of(tp));
 
-    public void processRecord(
-            ConsumerRecord<String,String> record)
-            throws Exception {
+        Map<TopicPartition, Long> request =
+                Map.of(tp, timestamp);
 
-        KafkaEnvelope envelope =
-                mapper.readValue(
-                        record.value(),
-                        KafkaEnvelope.class
-                );
+        Map<TopicPartition,
+                OffsetAndTimestamp>
+                result =
+                consumer.offsetsForTimes(
+                        request);
 
-        String payload =
-                compressionDecoder.decode(
-                        envelope.getRecordBody(),
-                        envelope.getRecordBodyCompression()
-                );
+        OffsetAndTimestamp oat =
+                result.get(tp);
 
-        JsonNode node =
-                decoder.decode(payload);
+        if(oat != null) {
 
-        String prettyJson =
-                decoder.prettyPrint(node);
-
-        printer.printEnvelope(
-                envelope,
-                record.offset(),
-                record.partition(),
-                prettyJson
-        );
+            consumer.seek(tp,
+                    oat.offset());
+        }
     }
-}
-=========================================================================
-{
-  "record_uuid":"12345",
-  "record_timestamp":"2026-06-09T04:00:00Z",
-  "dataset_storage_uuid":"abc-123",
-  "record_body":"{\"inventoryId\":2101,\"status\":\"Settled\",\"instrumentSource\":\"SOPHIS\"}",
-  "record_body_compression":"NONE"
-}
-
-Output
-=================================================
-Record UUID      : 12345
-Record Timestamp : 2026-06-09T04:00:00Z
-Dataset UUID     : abc-123
-Partition        : 8
-Offset           : 148251599
-Compression      : NONE
--------------------------------------------------
-
-{
-  "inventoryId" : 2101,
-  "status" : "Settled",
-  "instrumentSource" : "SOPHIS"
-}
-
-=================================================
-
-#!/usr/bin/env bash
-
-# =============================================================================
-# TDVPS Kafka Admin Tool
-#
-# Utility script for:
-#   - Build Project
-#   - Start Local Kafka
-#   - Produce Test Messages
-#   - Consume Kafka Messages
-#   - Consume By Offset
-#   - Consume By Timestamp
-# =============================================================================
-
-set -e
-
-PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-JAR_FILE="$PROJECT_DIR/target/tdvps-admin-tool-1.0.0.jar"
-
-BOOTSTRAP_SERVER="localhost:9092"
-
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
-
-info() {
-  echo -e "${GREEN}[INFO]${NC} $1"
-}
-
-warn() {
-  echo -e "${YELLOW}[WARN]${NC} $1"
-}
-
-error() {
-  echo -e "${RED}[ERROR]${NC} $1"
-}
-
-# =============================================================================
-# Build
-# =============================================================================
-
-build() {
-
-  info "Building application..."
-
-  cd "$PROJECT_DIR"
-
-  mvn clean package -DskipTests
-
-  info "Build successful"
-}
-
-# =============================================================================
-# Start Kafka
-# =============================================================================
-
-start_local() {
-
-  info "Starting Kafka cluster..."
-
-  docker-compose up -d
-
-  sleep 10
-
-  info "Kafka started"
-}
-
-# =============================================================================
-# Stop Kafka
-# =============================================================================
-
-stop_local() {
-
-  info "Stopping Kafka..."
-
-  docker-compose down
-
-  info "Kafka stopped"
-}
-
-# =============================================================================
-# Producer
-# =============================================================================
-
-produce() {
-
-  info "Producing test messages..."
-
-  java -jar "$JAR_FILE" \
-    produce \
-    --bootstrap-server "$BOOTSTRAP_SERVER" \
-    "$@"
-}
-
-# =============================================================================
-# Consumer
-# =============================================================================
-
-consume() {
-
-  info "Starting consumer..."
-
-  java -jar "$JAR_FILE" \
-    consume \
-    --bootstrap-server "$BOOTSTRAP_SERVER" \
-    "$@"
-}
-
-# =============================================================================
-# Consume From Beginning
-# =============================================================================
-
-consume_from_start() {
-
-  TOPIC="$1"
-
-  info "Reading topic from offset 0"
-
-  java -jar "$JAR_FILE" \
-    consume \
-    --bootstrap-server "$BOOTSTRAP_SERVER" \
-    --topic "$TOPIC" \
-    --offset 0
-}
-
-# =============================================================================
-# Consume By Timestamp
-# =============================================================================
-
-consume_at_time() {
-
-  TOPIC="$1"
-  TIMESTAMP="$2"
-
-  info "Reading topic from timestamp"
-
-  java -jar "$JAR_FILE" \
-    consume \
-    --bootstrap-server "$BOOTSTRAP_SERVER" \
-    --topic "$TOPIC" \
-    --at-time "$TIMESTAMP"
-}
-
-# =============================================================================
-# Command Dispatcher
-# =============================================================================
-
-COMMAND="$1"
-
-shift || true
-
-case "$COMMAND" in
-
-  build)
-    build
-    ;;
-
-  start-local)
-    start_local
-    ;;
-
-  stop-local)
-    stop_local
-    ;;
-
-  produce)
-    produce "$@"
-    ;;
-
-  consume)
-    consume "$@"
-    ;;
-
-  consume-from-start)
-    consume_from_start "$@"
-    ;;
-
-  consume-at-time)
-    consume_at_time "$@"
-    ;;
-
-  *)
-    echo ""
-    echo "TDVPS Kafka Admin Tool"
-    echo ""
-    echo "Commands:"
-    echo ""
-    echo " build"
-    echo " start-local"
-    echo " stop-local"
-    echo " produce"
-    echo " consume"
-    echo " consume-from-start <topic>"
-    echo " consume-at-time <topic> <epoch-ms>"
-    echo ""
-    ;;
-esac
-===============================
-Example Usage
-Build
-./scripts/tdvps-kafka.sh build
-Start Kafka
-./scripts/tdvps-kafka.sh start-local
-Produce Messages
-./scripts/tdvps-kafka.sh produce \
-  --topic positions-topic \
-  --count 10
-Consume Messages
-./scripts/tdvps-kafka.sh consume \
-  --topic positions-topic
-Read From Offset
-./scripts/tdvps-kafka.sh consume \
-  --topic positions-topic \
-  --partition 0 \
-  --offset 100
-Read From Timestamp
-./scripts/tdvps-kafka.sh consume-at-time \
-  positions-topic \
-  1750000000000
-Stop Kafka
-./scripts/tdvps-kafka.sh stop-local
-Sample Output
-[INFO] Starting consumer...
-
-=================================================
-Record UUID      : 12345
-Record Timestamp : 2026-06-09T04:00:00Z
-Dataset UUID     : abc-123
-Partition        : 8
-Offset           : 148251599
-Compression      : NONE
--------------------------------------------------
-
-{
-  "inventoryId" : 2101,
-  "status" : "Settled",
-  "instrumentSource" : "SOPHIS"
-}
-
-=================================================
-
-check_kafka() {
-
-  info "Checking Kafka availability..."
-
-  nc -z localhost 9092
-
-  if [ $? -eq 0 ]; then
-    info "Kafka is running on localhost:9092"
-  else
-    error "Kafka is not running on localhost:9092"
-  fi
-}
-
-==================
-Option 2: Start Local Kafka Automatically
-
-If your Kafka installation is located at:
-
-D:\kafka
-
-or
-
-C:\kafka
-
-you can start Zookeeper and Kafka via batch files.
-
-Windows Commands
-
-Start Zookeeper:
-
-bin\windows\zookeeper-server-start.bat config\zookeeper.properties
-
-Start Kafka:
-
-bin\windows\kafka-server-start.bat config\server.properties
-Bash Script Example
-start_local() {
-
-  info "Starting local Kafka..."
-
-  cmd.exe /c \
-  "D:\kafka\bin\windows\zookeeper-server-start.bat D:\kafka\config\zookeeper.properties"
-
-  sleep 10
-
-  cmd.exe /c \
-  "D:\kafka\bin\windows\kafka-server-start.bat D:\kafka\config\server.properties"
-
-  sleep 10
-
-  info "Kafka started."
 }
